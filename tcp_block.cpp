@@ -79,8 +79,17 @@ int packet_to_ip_hdr(const uint8_t* p, struct libnet_ipv4_hdr* ip_hdr) {
   }
   return 0;
 }
-
+uint8_t get_checksum(uint8_t* p, uint32_t num){
+  uint16_t tot = 0;
+  for(uint32_t i = 0; i < num; i++){
+    tot += ((p[2*i]<<8)|p[2*i+1]);
+    while(tot>>16)
+      tot = (tot>>16) + (tot & 0xffff);
+  }
+  return (uint8_t)~tot; 
+}
 void ip_hdr_to_packet(uint8_t* p, libnet_ipv4_hdr* ip_hdr){
+  uint8_t* st_idx = p;
   *(p++) = (ip_hdr->ip_v << 4) | (ip_hdr->ip_hl);
   *(p++) = ip_hdr->ip_tos;
   i2byte_s(p, ip_hdr->ip_len); p += 2;
@@ -88,9 +97,13 @@ void ip_hdr_to_packet(uint8_t* p, libnet_ipv4_hdr* ip_hdr){
   i2byte_s(p, ip_hdr->ip_off); p += 2;
   *(p++) = ip_hdr->ip_ttl;
   *(p++) = ip_hdr->ip_p;
-  i2byte_s(p, ip_hdr->ip_sum); p += 2;
+  *(p++) = 0;
+  *(p++) = 0;
   i2byte_l(p, ip_hdr->ip_src.s_addr); p += 4;
   i2byte_l(p, ip_hdr->ip_dst.s_addr);
+  uint8_t checksum = get_checksum(st_idx, 10);
+  i2byte_s(p-6, checksum);
+  printf("checksum %d -> %d\n", ip_hdr->ip_sum, checksum);
 }
 
 int packet_to_tcp_hdr(const uint8_t *p, struct libnet_tcp_hdr *tcp_hdr) {
@@ -128,7 +141,7 @@ int packet_to_tcp_hdr(const uint8_t *p, struct libnet_tcp_hdr *tcp_hdr) {
   return 0;
 }
 
-void tcp_hdr_to_packet(uint8_t* p, struct libnet_tcp_hdr* tcp_hdr){
+void tcp_hdr_to_packet(uint8_t* p, struct libnet_ipv4_hdr* ip_hdr, struct libnet_tcp_hdr* tcp_hdr, uint8_t* tcp_data, uint32_t tcp_data_len){
   i2byte_s(p,tcp_hdr->th_sport); p += 2;
   i2byte_s(p, tcp_hdr->th_dport); p += 2;
   i2byte_l(p, tcp_hdr->th_seq); p += 4;
@@ -136,8 +149,20 @@ void tcp_hdr_to_packet(uint8_t* p, struct libnet_tcp_hdr* tcp_hdr){
   *(p++) = (tcp_hdr->th_off << 4) | (tcp_hdr->th_x2);
   *(p++) = tcp_hdr->th_flags;
   i2byte_s(p, tcp_hdr->th_win); p += 2;
-  i2byte_s(p, tcp_hdr->th_sum); p += 2;
-  i2byte_s(p, tcp_hdr->th_urp); p += 2;  
+  *(p++) = 0;
+  *(p++) = 0;
+//  i2byte_s(p, tcp_hdr->th_sum); p += 2;
+  i2byte_s(p, tcp_hdr->th_urp);
+  uint8_t* pseudo_hdr = (uint8_t*)malloc(sizeof(uint8_t)*12);
+  uint8_t* ptr = pseudo_hdr;
+  i2byte_l(ptr, ip_hdr->ip_src.s_addr); ptr+=4;
+  i2byte_l(ptr, ip_hdr->ip_dst.s_addr); ptr+=4;
+  *(ptr++) = 0;
+  *(ptr++) = ip_hdr->ip_p; 
+  i2byte_s(ptr, ip_hdr->ip_len - (ip_hdr->ip_hl<<2)); ptr+=2;
+  //TODO : checksum of pseudo_hdr + checksum of p + checksum of tcp_data
+
+
 }
 
 int is_http(const uint8_t *data, uint32_t len) {
@@ -197,7 +222,7 @@ void tcp_block(pcap_t* handle){
       tcp_hdr_back.th_flags = 0b10001; // ACK, FIN
       eth_hdr_to_packet(fin_msg, &eth_hdr_back);
       ip_hdr_to_packet(fin_msg+ETHERNET_HEADER_LEN, &ip_hdr_back);
-      tcp_hdr_to_packet(fin_msg+ETHERNET_HEADER_LEN+IP_HEADER_LEN, &tcp_hdr_back);
+      tcp_hdr_to_packet(fin_msg+ETHERNET_HEADER_LEN+IP_HEADER_LEN, &ip_hdr_back, &tcp_hdr_back, (uint8_t*)redir_msg, redir_msg_len);
       memcpy(fin_msg+ ETHERNET_HEADER_LEN + IP_HEADER_LEN + TCP_HEADER_LEN,redir_msg, redir_msg_len);
       pcap_sendpacket(handle, fin_msg, ETHERNET_HEADER_LEN + IP_HEADER_LEN + TCP_HEADER_LEN+redir_msg_len);
 
@@ -212,7 +237,7 @@ void tcp_block(pcap_t* handle){
       tcp_hdr_back.th_flags = 0b10100; // ACK, RST
       eth_hdr_to_packet(rst_msg, &eth_hdr_back);
       ip_hdr_to_packet(rst_msg+ETHERNET_HEADER_LEN, &ip_hdr_back);
-      tcp_hdr_to_packet(rst_msg+ETHERNET_HEADER_LEN+IP_HEADER_LEN, &tcp_hdr_back);
+      tcp_hdr_to_packet(rst_msg+ETHERNET_HEADER_LEN+IP_HEADER_LEN, &ip_hdr_back, &tcp_hdr_back, NULL, 0);
       pcap_sendpacket(handle, rst_msg, ETHERNET_HEADER_LEN + IP_HEADER_LEN + TCP_HEADER_LEN);    
     }
     // forward RST
@@ -223,7 +248,7 @@ void tcp_block(pcap_t* handle){
     uint8_t rst_msg[ETHERNET_HEADER_LEN + IP_HEADER_LEN + TCP_HEADER_LEN];
     eth_hdr_to_packet(rst_msg, &eth_hdr_back);
     ip_hdr_to_packet(rst_msg+ETHERNET_HEADER_LEN, &ip_hdr);
-    tcp_hdr_to_packet(rst_msg+ETHERNET_HEADER_LEN+IP_HEADER_LEN, &tcp_hdr);
+    tcp_hdr_to_packet(rst_msg+ETHERNET_HEADER_LEN+IP_HEADER_LEN, &ip_hdr, &tcp_hdr, NULL, 0);
     pcap_sendpacket(handle, rst_msg, ETHERNET_HEADER_LEN + IP_HEADER_LEN + TCP_HEADER_LEN);    
   }
 }
