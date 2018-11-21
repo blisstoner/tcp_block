@@ -79,14 +79,17 @@ int packet_to_ip_hdr(const uint8_t* p, struct libnet_ipv4_hdr* ip_hdr) {
   }
   return 0;
 }
-uint8_t get_checksum(uint8_t* p, uint32_t num){
-  uint16_t tot = 0;
-  for(uint32_t i = 0; i < num; i++){
-    tot += ((p[2*i]<<8)|p[2*i+1]);
+// not complement!
+uint16_t get_checksum(uint8_t* p, uint32_t len){
+  if(len==0) return 0;
+  uint32_t tot = 0;
+  if(len % 2 == 1) tot = (p[--len] << 8);
+  for(uint32_t i = 0; i < len; i+=2){
+    tot += ((p[i]<<8)|p[i+1]);
     while(tot>>16)
       tot = (tot>>16) + (tot & 0xffff);
   }
-  return (uint8_t)~tot; 
+  return tot; 
 }
 void ip_hdr_to_packet(uint8_t* p, libnet_ipv4_hdr* ip_hdr){
   uint8_t* st_idx = p;
@@ -101,9 +104,8 @@ void ip_hdr_to_packet(uint8_t* p, libnet_ipv4_hdr* ip_hdr){
   *(p++) = 0;
   i2byte_l(p, ip_hdr->ip_src.s_addr); p += 4;
   i2byte_l(p, ip_hdr->ip_dst.s_addr);
-  uint8_t checksum = get_checksum(st_idx, 10);
+  uint16_t checksum = ~get_checksum(st_idx, 20);
   i2byte_s(p-6, checksum);
-  printf("checksum %d -> %d\n", ip_hdr->ip_sum, checksum);
 }
 
 int packet_to_tcp_hdr(const uint8_t *p, struct libnet_tcp_hdr *tcp_hdr) {
@@ -142,6 +144,7 @@ int packet_to_tcp_hdr(const uint8_t *p, struct libnet_tcp_hdr *tcp_hdr) {
 }
 
 void tcp_hdr_to_packet(uint8_t* p, struct libnet_ipv4_hdr* ip_hdr, struct libnet_tcp_hdr* tcp_hdr, uint8_t* tcp_data, uint32_t tcp_data_len){
+  uint8_t* st_idx = p;
   i2byte_s(p,tcp_hdr->th_sport); p += 2;
   i2byte_s(p, tcp_hdr->th_dport); p += 2;
   i2byte_l(p, tcp_hdr->th_seq); p += 4;
@@ -161,8 +164,11 @@ void tcp_hdr_to_packet(uint8_t* p, struct libnet_ipv4_hdr* ip_hdr, struct libnet
   *(ptr++) = ip_hdr->ip_p; 
   i2byte_s(ptr, ip_hdr->ip_len - (ip_hdr->ip_hl<<2)); ptr+=2;
   //TODO : checksum of pseudo_hdr + checksum of p + checksum of tcp_data
-
-
+  uint32_t chk_tmp = (uint32_t)get_checksum(pseudo_hdr, 12) + get_checksum(st_idx,TCP_HEADER_LEN) + get_checksum(tcp_data, tcp_data_len);
+  while(chk_tmp >> 16) chk_tmp = (chk_tmp>>16)+(chk_tmp&0xffff);
+  uint16_t checksum = (uint16_t)~chk_tmp;
+  free(pseudo_hdr);
+  i2byte_s(p-2, checksum);
 }
 
 int is_http(const uint8_t *data, uint32_t len) {
@@ -180,7 +186,9 @@ int is_http(const uint8_t *data, uint32_t len) {
 
 void tcp_block(pcap_t* handle){
   char* redir_msg = "HTTP/1.1 302 Redirect\r\nLocation: http://blog.encrypted.gg\r\n\r\n";
+  //char* redir_msg = "HTTP/1.1 404 Error\r\nBLOCKED\r\n\r\n";
   uint32_t redir_msg_len = strlen(redir_msg);
+  int isfirst = 1;
   while (1) {
     struct pcap_pkthdr* header;
     const uint8_t* p;
@@ -201,6 +209,8 @@ void tcp_block(pcap_t* handle){
     libnet_tcp_hdr tcp_hdr;
     if (ip_hdr.ip_p != IPPROTO_TCP) continue;
     if(packet_to_tcp_hdr(p + ETHERNET_HEADER_LEN + (ip_hdr.ip_hl << 2), &tcp_hdr) != 0) continue;
+    if((tcp_hdr.th_flags & 0b111)) continue; // RST or FIN or SYN packet
+
     const uint8_t* tcp_data = p + (ip_hdr.ip_hl << 2) + (tcp_hdr.th_off << 2) + ETHERNET_HEADER_LEN;
     uint32_t data_len = len - (ip_hdr.ip_hl << 2) - (tcp_hdr.th_off << 2) - ETHERNET_HEADER_LEN;
     libnet_ethernet_hdr eth_hdr_back;
@@ -224,6 +234,9 @@ void tcp_block(pcap_t* handle){
       ip_hdr_to_packet(fin_msg+ETHERNET_HEADER_LEN, &ip_hdr_back);
       tcp_hdr_to_packet(fin_msg+ETHERNET_HEADER_LEN+IP_HEADER_LEN, &ip_hdr_back, &tcp_hdr_back, (uint8_t*)redir_msg, redir_msg_len);
       memcpy(fin_msg+ ETHERNET_HEADER_LEN + IP_HEADER_LEN + TCP_HEADER_LEN,redir_msg, redir_msg_len);
+      //printf("redir sent\n");
+      //for(int i = 0; i < ETHERNET_HEADER_LEN + IP_HEADER_LEN + TCP_HEADER_LEN+redir_msg_len; i++) printf("%02x ", fin_msg[i]);
+      //printf("\n");
       pcap_sendpacket(handle, fin_msg, ETHERNET_HEADER_LEN + IP_HEADER_LEN + TCP_HEADER_LEN+redir_msg_len);
 
       //      uint8_t tmp[1500] = {};
@@ -246,7 +259,7 @@ void tcp_block(pcap_t* handle){
     tcp_hdr.th_flags = 0b10100; // ACK, RST
     tcp_hdr.th_seq += data_len;
     uint8_t rst_msg[ETHERNET_HEADER_LEN + IP_HEADER_LEN + TCP_HEADER_LEN];
-    eth_hdr_to_packet(rst_msg, &eth_hdr_back);
+    eth_hdr_to_packet(rst_msg, &eth_hdr);
     ip_hdr_to_packet(rst_msg+ETHERNET_HEADER_LEN, &ip_hdr);
     tcp_hdr_to_packet(rst_msg+ETHERNET_HEADER_LEN+IP_HEADER_LEN, &ip_hdr, &tcp_hdr, NULL, 0);
     pcap_sendpacket(handle, rst_msg, ETHERNET_HEADER_LEN + IP_HEADER_LEN + TCP_HEADER_LEN);    
@@ -262,10 +275,9 @@ int main(int argc, char* argv[]) {
     usage();
     return -1;
   }
-
   char* dev = argv[1];
   char errbuf[PCAP_ERRBUF_SIZE];
-  pcap_t* handle = pcap_open_live(dev, BUFSIZ, 1, 1, errbuf);
+  pcap_t* handle = pcap_open_live(dev, BUFSIZ, 1, 0, errbuf);
 
   // pcap_t *handle = pcap_open_offline("20180927_arp.pcap", errbuf);
   if (handle == NULL) {
